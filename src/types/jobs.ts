@@ -3,6 +3,7 @@ export type EmrVendor = "wellsky_home_health";
 export interface PullScheduleReportInput {
   job_id?: string;
   idempotency_key?: string;
+  selector_profile_id?: string;
   tenant_id: string;
   emr_vendor: EmrVendor;
   date_from: string;
@@ -32,6 +33,11 @@ export interface NormalizedArtifactMetadata {
   };
   discipline_count: number;
   report_profile_id: string;
+  selector_profile_id: string;
+  selector_version: string;
+  created_at: string;
+  expires_at: string;
+  purged_at?: string;
   artifact_root: string;
 }
 
@@ -41,6 +47,8 @@ export interface ExecutionEvidenceBundle {
   timestamps_path: string;
   screenshots: string[];
   export_filename: string;
+  selector_profile_id: string;
+  selector_version: string;
   last_step: string;
 }
 
@@ -48,6 +56,15 @@ export interface PullScheduleReportOutput {
   file: DownloadedFileMetadata;
   artifact_metadata: NormalizedArtifactMetadata;
   evidence_bundle: ExecutionEvidenceBundle;
+  artifact_id: string;
+  artifact_filename: string;
+  artifact_sha256: string;
+  artifact_bytes: number;
+  artifact_mime_type: string;
+  artifact_ready: true;
+  created_at: string;
+  expires_at: string;
+  purged_at?: string;
 }
 
 export interface PullScheduleReportFailure {

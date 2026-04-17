@@ -18,6 +18,8 @@ const ALLOWED_DETAIL_KEYS = new Set([
   "date_to",
   "discipline_count",
   "report_profile_id",
+  "selector_profile_id",
+  "selector_version",
   "selector",
   "url",
   "artifact_path",

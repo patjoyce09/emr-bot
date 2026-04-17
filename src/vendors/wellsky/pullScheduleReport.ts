@@ -9,11 +9,16 @@ import type {
   PullScheduleReportInput,
   PullScheduleReportOutput
 } from "../../types/jobs.js";
-import { wellSkySelectors } from "./selectors.js";
+import { selectorForDiscipline, type WellSkySelectors } from "./selectors.js";
 import type { WellSkyWorkerConfig } from "./session.js";
 
 interface ExecutionContext {
   runId: string;
+  artifactId: string;
+  expiresAt: string;
+  selectorProfileId: string;
+  selectorVersion: string;
+  selectors: WellSkySelectors;
   page: Page;
   logger: StructuredStepLogger;
   artifacts: ArtifactPaths;
@@ -39,15 +44,15 @@ async function screenshot(page: Page, targetPath: string): Promise<string> {
   return targetPath;
 }
 
-async function captureDomMarkers(page: Page): Promise<Record<string, number>> {
+async function captureDomMarkers(page: Page, selectors: WellSkySelectors): Promise<Record<string, number>> {
   const markers: Record<string, number> = {};
   const trackedSelectors = {
-    report_ready: wellSkySelectors.reportReadyMarker,
-    date_from: wellSkySelectors.dateFromInput,
-    date_to: wellSkySelectors.dateToInput,
-    discipline_filter: wellSkySelectors.disciplineDropdown,
-    report_profile: wellSkySelectors.reportProfileInput,
-    export_button: wellSkySelectors.exportButton
+    report_ready: selectors.reportReadyMarker,
+    date_from: selectors.dateFromInput,
+    date_to: selectors.dateToInput,
+    discipline_filter: selectors.disciplineDropdown,
+    report_profile: selectors.reportProfileInput,
+    export_button: selectors.exportButton
   };
 
   for (const [name, selector] of Object.entries(trackedSelectors)) {
@@ -57,12 +62,12 @@ async function captureDomMarkers(page: Page): Promise<Record<string, number>> {
   return markers;
 }
 
-async function applyDisciplines(page: Page, disciplines: string[]): Promise<void> {
-  const dropdown = page.locator(wellSkySelectors.disciplineDropdown).first();
+async function applyDisciplines(page: Page, disciplines: string[], selectors: WellSkySelectors): Promise<void> {
+  const dropdown = page.locator(selectors.disciplineDropdown).first();
   await dropdown.click();
 
   for (const discipline of disciplines) {
-    await page.locator(wellSkySelectors.disciplineOption(discipline)).first().click();
+    await page.locator(selectorForDiscipline(selectors, discipline)).first().click();
   }
 }
 
@@ -81,7 +86,7 @@ export async function runPullScheduleReport(
 
     ctx.logger.push("report.goto", "started", { url: reportUrl });
     await ctx.page.goto(reportUrl, { waitUntil: "domcontentloaded" });
-    await ctx.page.locator(wellSkySelectors.reportReadyMarker).first().waitFor({ timeout: 45_000 });
+    await ctx.page.locator(ctx.selectors.reportReadyMarker).first().waitFor({ timeout: 45_000 });
     ctx.logger.push("report.goto", "succeeded", { url: reportUrl });
 
     const preFilterShot = await screenshot(
@@ -94,8 +99,8 @@ export async function runPullScheduleReport(
       date_from: ctx.input.date_from,
       date_to: ctx.input.date_to
     });
-    await ctx.page.locator(wellSkySelectors.dateFromInput).first().fill(ctx.input.date_from);
-    await ctx.page.locator(wellSkySelectors.dateToInput).first().fill(ctx.input.date_to);
+    await ctx.page.locator(ctx.selectors.dateFromInput).first().fill(ctx.input.date_from);
+    await ctx.page.locator(ctx.selectors.dateToInput).first().fill(ctx.input.date_to);
     ctx.logger.push("report.set_dates", "succeeded", {
       date_from: ctx.input.date_from,
       date_to: ctx.input.date_to
@@ -104,7 +109,7 @@ export async function runPullScheduleReport(
     ctx.logger.push("report.set_disciplines", "started", {
       discipline_count: ctx.input.disciplines.length
     });
-    await applyDisciplines(ctx.page, ctx.input.disciplines);
+    await applyDisciplines(ctx.page, ctx.input.disciplines, ctx.selectors);
     ctx.logger.push("report.set_disciplines", "succeeded", {
       discipline_count: ctx.input.disciplines.length
     });
@@ -112,7 +117,7 @@ export async function runPullScheduleReport(
     ctx.logger.push("report.set_profile", "started", {
       report_profile_id: ctx.input.report_profile_id
     });
-    const profileInput = ctx.page.locator(wellSkySelectors.reportProfileInput).first();
+    const profileInput = ctx.page.locator(ctx.selectors.reportProfileInput).first();
     try {
       await profileInput.selectOption(ctx.input.report_profile_id);
     } catch {
@@ -131,7 +136,7 @@ export async function runPullScheduleReport(
     ctx.logger.push("report.export", "started");
     const [download] = await Promise.all([
       ctx.page.waitForEvent("download", { timeout: 90_000 }),
-      ctx.page.locator(wellSkySelectors.exportButton).first().click()
+      ctx.page.locator(ctx.selectors.exportButton).first().click()
     ]);
 
     exportFilename = download.suggestedFilename();
@@ -148,17 +153,20 @@ export async function runPullScheduleReport(
     );
     screenshots.push(postExportShot);
 
-    const domMarkers = await captureDomMarkers(ctx.page);
+    const domMarkers = await captureDomMarkers(ctx.page, ctx.selectors);
     await writeJson(domMarkersPath, domMarkers);
 
     await writeJson(timestampsPath, {
       started_at: ctx.logger.steps[0]?.timestamp,
-      ended_at: new Date().toISOString()
+      ended_at: new Date().toISOString(),
+      selector_profile_id: ctx.selectorProfileId,
+      selector_version: ctx.selectorVersion
     });
 
     await writeJson(stepLogPath, ctx.logger.steps);
 
     const fileMeta = await getFileMetadata(downloadPath);
+    const createdAt = new Date().toISOString();
     ctx.logger.push("report.verify_download", "started", {
       filename: fileMeta.filename,
       bytes: fileMeta.bytes
@@ -170,13 +178,14 @@ export async function runPullScheduleReport(
     });
 
     return {
+      created_at: createdAt,
       file: {
         path: downloadPath,
         filename: fileMeta.filename,
         bytes: fileMeta.bytes,
         sha256: fileMeta.sha256,
         mime_type: fileMeta.mime_type,
-        created_at: new Date().toISOString()
+        created_at: createdAt
       },
       artifact_metadata: {
         job_id: ctx.input.job_id || ctx.runId,
@@ -190,6 +199,10 @@ export async function runPullScheduleReport(
         },
         discipline_count: ctx.input.disciplines.length,
         report_profile_id: ctx.input.report_profile_id,
+        selector_profile_id: ctx.selectorProfileId,
+        selector_version: ctx.selectorVersion,
+        created_at: createdAt,
+        expires_at: ctx.expiresAt,
         artifact_root: ctx.artifacts.runRoot
       },
       evidence_bundle: {
@@ -198,8 +211,18 @@ export async function runPullScheduleReport(
         timestamps_path: timestampsPath,
         screenshots,
         export_filename: exportFilename,
+        selector_profile_id: ctx.selectorProfileId,
+        selector_version: ctx.selectorVersion,
         last_step: ctx.logger.lastStep
-      }
+      },
+      artifact_id: ctx.artifactId,
+      artifact_filename: fileMeta.filename,
+      artifact_sha256: fileMeta.sha256,
+      artifact_bytes: fileMeta.bytes,
+      artifact_mime_type: fileMeta.mime_type,
+      artifact_ready: true,
+      expires_at: ctx.expiresAt,
+      purged_at: undefined
     };
   } catch (error) {
     const category = categorizeError(error);
@@ -213,13 +236,15 @@ export async function runPullScheduleReport(
     );
     screenshots.push(failureScreenshot);
 
-    const domMarkers = await captureDomMarkers(ctx.page).catch(() => ({}));
+    const domMarkers = await captureDomMarkers(ctx.page, ctx.selectors).catch(() => ({}));
 
     await Promise.all([
       writeJson(domMarkersPath, domMarkers),
       writeJson(timestampsPath, {
         started_at: ctx.logger.steps[0]?.timestamp,
-        failed_at: new Date().toISOString()
+        failed_at: new Date().toISOString(),
+        selector_profile_id: ctx.selectorProfileId,
+        selector_version: ctx.selectorVersion
       }),
       writeJson(stepLogPath, ctx.logger.steps)
     ]);
@@ -238,6 +263,8 @@ export async function runPullScheduleReport(
         timestamps_path: timestampsPath,
         screenshots,
         export_filename: exportFilename,
+        selector_profile_id: ctx.selectorProfileId,
+        selector_version: ctx.selectorVersion,
         last_step: ctx.logger.lastStep
       }
     };

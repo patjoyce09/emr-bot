@@ -1,7 +1,7 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import type { StructuredStepLogger } from "../../core/logger.js";
 import type { WellSkyCredentials } from "../../core/secrets.js";
-import { wellSkySelectors } from "./selectors.js";
+import type { WellSkySelectors } from "./selectors.js";
 
 export interface WellSkyWorkerConfig {
   baseUrl: string;
@@ -45,7 +45,8 @@ export async function bootstrapWellSkySession(
   page: Page,
   credentials: WellSkyCredentials,
   logger: StructuredStepLogger,
-  config: WellSkyWorkerConfig
+  config: WellSkyWorkerConfig,
+  selectors: WellSkySelectors
 ): Promise<void> {
   const loginUrl = new URL(config.loginPath, config.baseUrl).toString();
   logger.push("wellsky.goto_login", "started", { url: loginUrl });
@@ -53,12 +54,12 @@ export async function bootstrapWellSkySession(
   logger.push("wellsky.goto_login", "succeeded", { url: loginUrl });
 
   logger.push("wellsky.login", "started");
-  await page.locator(wellSkySelectors.usernameInput).first().fill(credentials.username);
-  await page.locator(wellSkySelectors.passwordInput).first().fill(credentials.password);
-  await page.locator(wellSkySelectors.loginButton).first().click();
+  await page.locator(selectors.usernameInput).first().fill(credentials.username);
+  await page.locator(selectors.passwordInput).first().fill(credentials.password);
+  await page.locator(selectors.loginButton).first().click();
 
   try {
-    await page.locator(wellSkySelectors.postLoginReadyMarker).first().waitFor({ timeout: 45_000 });
+    await page.locator(selectors.postLoginReadyMarker).first().waitFor({ timeout: 45_000 });
   } catch {
     const mfaPromptVisible = await page.getByText(/mfa|multi-factor|verification code/i).first().isVisible().catch(() => false);
     if (mfaPromptVisible) {
@@ -70,7 +71,7 @@ export async function bootstrapWellSkySession(
       throw new Error("Permission denied after login.");
     }
 
-    const usernameStillVisible = await page.locator(wellSkySelectors.usernameInput).first().isVisible().catch(() => false);
+    const usernameStillVisible = await page.locator(selectors.usernameInput).first().isVisible().catch(() => false);
     if (usernameStillVisible) {
       throw new Error("Login failed with provided credentials.");
     }
