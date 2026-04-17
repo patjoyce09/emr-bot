@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { normalizePathSegment } from "./pathSafety.js";
 
 export interface ArtifactPaths {
   runRoot: string;
@@ -15,7 +16,11 @@ export async function createArtifactPaths(
   jobName: string,
   runId: string
 ): Promise<ArtifactPaths> {
-  const runRoot = join(artifactsRoot, tenantId, jobName, runId);
+  const safeTenantSegment = normalizePathSegment(tenantId, "tenant");
+  const safeJobSegment = normalizePathSegment(jobName, "job");
+  const safeRunSegment = normalizePathSegment(runId, "run");
+
+  const runRoot = join(artifactsRoot, safeTenantSegment, safeJobSegment, safeRunSegment);
   const screenshotsDir = join(runRoot, "screenshots");
   const downloadsDir = join(runRoot, "downloads");
   const evidenceDir = join(runRoot, "evidence");

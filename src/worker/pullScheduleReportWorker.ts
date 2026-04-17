@@ -1,16 +1,23 @@
-import { attachJobResult, claimNextQueuedJob, updateJobStatus, type JobRecord } from "../core/jobStore.js";
+import { attachJobResult, claimNextQueuedJob, heartbeatJobLease, recoverStaleRunningJobs, updateJobStatus, type JobRecord } from "../core/jobStore.js";
 import { executePullScheduleReportJob } from "../jobs/pullScheduleReportJob.js";
-import type { PullScheduleReportFailure } from "../types/jobs.js";
+import type { PullScheduleReportFailure, PullScheduleReportInput, PullScheduleReportOutput } from "../types/jobs.js";
 
 interface WorkerConfig {
   pollIntervalMs: number;
+  leaseHeartbeatIntervalMs: number;
+  maxJobsPerTick?: number;
 }
+
+type JobExecutor = (payload: PullScheduleReportInput) => Promise<PullScheduleReportOutput | PullScheduleReportFailure>;
 
 export class PullScheduleReportWorker {
   private timer: NodeJS.Timeout | undefined;
   private isTicking = false;
 
-  constructor(private readonly config: WorkerConfig) {}
+  constructor(
+    private readonly config: WorkerConfig,
+    private readonly executeJob: JobExecutor = executePullScheduleReportJob
+  ) {}
 
   start(): void {
     if (this.timer) {
@@ -22,6 +29,10 @@ export class PullScheduleReportWorker {
     }, this.config.pollIntervalMs);
 
     void this.tick();
+  }
+
+  async runOnce(): Promise<void> {
+    await this.tick();
   }
 
   stop(): void {
@@ -41,13 +52,25 @@ export class PullScheduleReportWorker {
     this.isTicking = true;
 
     try {
+      await recoverStaleRunningJobs();
+
+      const maxJobsPerTick = this.config.maxJobsPerTick && this.config.maxJobsPerTick > 0
+        ? this.config.maxJobsPerTick
+        : Number.POSITIVE_INFINITY;
+      let processed = 0;
+
       while (true) {
+        if (processed >= maxJobsPerTick) {
+          break;
+        }
+
         const claimed = await claimNextQueuedJob();
         if (!claimed) {
           break;
         }
 
         await this.processClaimedJob(claimed);
+        processed += 1;
       }
     } finally {
       this.isTicking = false;
@@ -55,8 +78,12 @@ export class PullScheduleReportWorker {
   }
 
   private async processClaimedJob(record: JobRecord): Promise<void> {
+    const heartbeatTimer = setInterval(() => {
+      void heartbeatJobLease(record.job_id);
+    }, this.config.leaseHeartbeatIntervalMs);
+
     try {
-      const result = await executePullScheduleReportJob(record.payload);
+      const result = await this.executeJob(record.payload);
 
       if ("error_category" in result) {
         await this.handleFailure(record, result);
@@ -85,6 +112,8 @@ export class PullScheduleReportWorker {
           last_step: "worker.exception"
         }
       });
+    } finally {
+      clearInterval(heartbeatTimer);
     }
   }
 

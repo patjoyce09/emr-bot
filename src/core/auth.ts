@@ -14,6 +14,8 @@ export interface TenantResolutionResult {
   tenant_id?: string;
 }
 
+const NONCE_CACHE = new Map<string, number>();
+
 export function attachRequestId(req: Request, res: Response, next: NextFunction): void {
   const headerRequestId = req.header("x-request-id")?.trim();
   const requestId = headerRequestId || randomUUID();
@@ -140,6 +142,39 @@ function secureCompare(a: string, b: string): boolean {
   return timingSafeEqual(left, right);
 }
 
+function nonceTtlSec(): number {
+  const raw = Number(process.env.EMR_GATEWAY_NONCE_TTL_SEC || process.env.EMR_GATEWAY_HMAC_MAX_SKEW_SEC || 300);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return 300;
+  }
+  return Math.floor(raw);
+}
+
+function purgeExpiredNonces(nowMs: number): void {
+  for (const [key, expiresAt] of NONCE_CACHE.entries()) {
+    if (expiresAt <= nowMs) {
+      NONCE_CACHE.delete(key);
+    }
+  }
+}
+
+function consumeNonce(nonce: string): boolean {
+  const nowMs = Date.now();
+  purgeExpiredNonces(nowMs);
+
+  const existing = NONCE_CACHE.get(nonce);
+  if (existing && existing > nowMs) {
+    return false;
+  }
+
+  NONCE_CACHE.set(nonce, nowMs + nonceTtlSec() * 1000);
+  return true;
+}
+
+function buildHmacBaseString(req: Request, timestamp: string, nonce: string, rawBody: string): string {
+  return [req.method.toUpperCase(), req.path, timestamp, nonce, rawBody].join("\n");
+}
+
 function parseBearerTenantMap(): Record<string, string> {
   const raw = process.env.EMR_GATEWAY_BEARER_TENANT_MAP;
   if (!raw) {
@@ -200,6 +235,7 @@ function verifyHmac(req: Request): CallerAuthContext | undefined {
 
   const signatureHeader = req.header("x-emr-signature")?.trim();
   const timestamp = req.header("x-emr-timestamp")?.trim();
+  const nonce = req.header("x-emr-nonce")?.trim() || "";
   const rawBody = (req as Request & { rawBody?: string }).rawBody;
 
   if (!signatureHeader || !timestamp) {
@@ -217,9 +253,16 @@ function verifyHmac(req: Request): CallerAuthContext | undefined {
     return undefined;
   }
 
-  const payload = `${timestamp}.${rawBody || ""}`;
+  if (nonce && !consumeNonce(nonce)) {
+    return undefined;
+  }
+
+  const payload = buildHmacBaseString(req, timestamp, nonce, rawBody || "");
   const digest = createHmac("sha256", secret).update(payload).digest("hex");
   if (!secureCompare(signatureHeader, digest)) {
+    if (nonce) {
+      NONCE_CACHE.delete(nonce);
+    }
     return undefined;
   }
 
@@ -253,6 +296,50 @@ export function requireCallerAuth(req: Request, res: Response, next: NextFunctio
   }
 
   (req as Request & { authContext?: CallerAuthContext }).authContext = context;
+
+  next();
+}
+
+export function requireAdminAccess(req: Request, res: Response, next: NextFunction): void {
+  const enabled = (process.env.ENABLE_ADMIN_ENDPOINTS || "false").toLowerCase() === "true";
+  if (!enabled) {
+    res.status(404).json({
+      ok: false,
+      error_category: "not_found",
+      message: "Not found"
+    });
+    return;
+  }
+
+  const expected = process.env.EMR_GATEWAY_ADMIN_TOKEN;
+  if (!expected) {
+    res.status(500).json({
+      ok: false,
+      error_category: "admin_auth_configuration_error",
+      message: "Admin auth is not configured"
+    });
+    return;
+  }
+
+  const auth = req.header("authorization") || "";
+  if (!auth.startsWith("Bearer ")) {
+    res.status(401).json({
+      ok: false,
+      error_category: "unauthorized_admin",
+      message: "Admin authentication failed"
+    });
+    return;
+  }
+
+  const provided = auth.slice("Bearer ".length).trim();
+  if (!secureCompare(provided, expected)) {
+    res.status(401).json({
+      ok: false,
+      error_category: "unauthorized_admin",
+      message: "Admin authentication failed"
+    });
+    return;
+  }
 
   next();
 }

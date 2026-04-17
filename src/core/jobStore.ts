@@ -11,6 +11,13 @@ export interface JobRecord {
   job_name: "pull_schedule_report";
   status: JobStatus;
   created_at: string;
+  queued_at: string;
+  started_at?: string;
+  completed_at?: string;
+  failed_at?: string;
+  claimed_at?: string;
+  heartbeat_at?: string;
+  lease_expires_at?: string;
   updated_at: string;
   request_id: string;
   attempt_count: number;
@@ -131,6 +138,22 @@ function storePath(): string {
   return resolve(process.env.JOB_STORE_PATH || "./state/jobs.json");
 }
 
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function leaseTimeoutMs(): number {
+  const raw = Number(process.env.JOB_LEASE_TIMEOUT_MS || 600_000);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return 600_000;
+  }
+  return Math.floor(raw);
+}
+
+function leaseExpiryIso(from: Date): string {
+  return new Date(from.getTime() + leaseTimeoutMs()).toISOString();
+}
+
 const adapter: JobStoreAdapter = new FileJobStoreAdapter(storePath());
 const mutex = new InProcessMutex();
 
@@ -158,18 +181,23 @@ export async function findByJobId(jobId: string): Promise<JobRecord | undefined>
 
 export async function createJob(record: JobRecord): Promise<JobRecord> {
   return withLockedState(async (state) => {
+    const normalizedRecord: JobRecord = {
+      ...record,
+      queued_at: record.queued_at || nowIso()
+    };
+
     const existingByJobId = state.records.find((item) => item.job_id === record.job_id);
     if (existingByJobId) {
       throw new Error("job_id already exists");
     }
 
-    const existingByIdempotency = state.records.find((item) => item.idempotency_key === record.idempotency_key);
+    const existingByIdempotency = state.records.find((item) => item.idempotency_key === normalizedRecord.idempotency_key);
     if (existingByIdempotency) {
       throw new Error("idempotency_key already exists");
     }
 
-    state.records.push(record);
-    return record;
+    state.records.push(normalizedRecord);
+    return normalizedRecord;
   });
 }
 
@@ -180,10 +208,57 @@ export async function updateJobStatus(jobId: string, status: JobStatus): Promise
       return undefined;
     }
 
+    const now = new Date();
+    const nowValue = now.toISOString();
+    const current = state.records[index];
+
+    let startedAt = current.started_at;
+    let completedAt = current.completed_at;
+    let failedAt = current.failed_at;
+    let queuedAt = current.queued_at;
+    let claimedAt = current.claimed_at;
+    let heartbeatAt = current.heartbeat_at;
+    let leaseExpiresAt = current.lease_expires_at;
+
+    if (status === "queued") {
+      queuedAt = nowValue;
+      claimedAt = undefined;
+      heartbeatAt = undefined;
+      leaseExpiresAt = undefined;
+    }
+
+    if (status === "running") {
+      startedAt = startedAt || nowValue;
+      claimedAt = nowValue;
+      heartbeatAt = nowValue;
+      leaseExpiresAt = leaseExpiryIso(now);
+    }
+
+    if (status === "succeeded") {
+      completedAt = nowValue;
+      claimedAt = undefined;
+      heartbeatAt = undefined;
+      leaseExpiresAt = undefined;
+    }
+
+    if (status === "failed" || status === "retry_exhausted") {
+      failedAt = nowValue;
+      claimedAt = undefined;
+      heartbeatAt = undefined;
+      leaseExpiresAt = undefined;
+    }
+
     const updated: JobRecord = {
-      ...state.records[index],
+      ...current,
       status,
-      updated_at: new Date().toISOString()
+      queued_at: queuedAt,
+      started_at: startedAt,
+      completed_at: completedAt,
+      failed_at: failedAt,
+      claimed_at: claimedAt,
+      heartbeat_at: heartbeatAt,
+      lease_expires_at: leaseExpiresAt,
+      updated_at: nowValue
     };
 
     state.records[index] = updated;
@@ -240,10 +315,17 @@ export async function claimNextQueuedJob(): Promise<JobRecord | undefined> {
       return undefined;
     }
 
+    const now = new Date();
+    const nowValue = now.toISOString();
+
     const claimed: JobRecord = {
       ...state.records[index],
       status: "running",
-      updated_at: new Date().toISOString(),
+      started_at: state.records[index].started_at || nowValue,
+      claimed_at: nowValue,
+      heartbeat_at: nowValue,
+      lease_expires_at: leaseExpiryIso(now),
+      updated_at: nowValue,
       attempt_count: state.records[index].attempt_count + 1
     };
 
@@ -267,6 +349,80 @@ export async function patchJob(jobId: string, patch: Partial<JobRecord>): Promis
 
     state.records[index] = updated;
     return updated;
+  });
+}
+
+export async function heartbeatJobLease(jobId: string): Promise<JobRecord | undefined> {
+  return withLockedState(async (state) => {
+    const index = state.records.findIndex((item) => item.job_id === jobId);
+    if (index < 0) {
+      return undefined;
+    }
+
+    const current = state.records[index];
+    if (current.status !== "running") {
+      return current;
+    }
+
+    const now = new Date();
+    const nowValue = now.toISOString();
+    const updated: JobRecord = {
+      ...current,
+      heartbeat_at: nowValue,
+      lease_expires_at: leaseExpiryIso(now),
+      updated_at: nowValue
+    };
+
+    state.records[index] = updated;
+    return updated;
+  });
+}
+
+export async function recoverStaleRunningJobs(): Promise<{ requeued: number; exhausted: number }> {
+  return withLockedState(async (state) => {
+    const nowMs = Date.now();
+    let requeued = 0;
+    let exhausted = 0;
+
+    for (let i = 0; i < state.records.length; i += 1) {
+      const current = state.records[i];
+      if (current.status !== "running") {
+        continue;
+      }
+
+      const leaseMs = Date.parse(current.lease_expires_at || "");
+      if (!Number.isFinite(leaseMs) || leaseMs > nowMs) {
+        continue;
+      }
+
+      const nowValue = nowIso();
+      if (current.attempt_count >= current.max_attempts) {
+        state.records[i] = {
+          ...current,
+          status: "retry_exhausted",
+          failed_at: nowValue,
+          claimed_at: undefined,
+          heartbeat_at: undefined,
+          lease_expires_at: undefined,
+          updated_at: nowValue
+        };
+        exhausted += 1;
+        continue;
+      }
+
+      state.records[i] = {
+        ...current,
+        status: "queued",
+        queued_at: nowValue,
+        claimed_at: undefined,
+        heartbeat_at: undefined,
+        lease_expires_at: undefined,
+        updated_at: nowValue
+      };
+      requeued += 1;
+    }
+
+    return { requeued, exhausted };
   });
 }
 

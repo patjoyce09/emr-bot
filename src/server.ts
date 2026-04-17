@@ -4,7 +4,7 @@ import { access } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import express, { type Request, type Response } from "express";
 import { z } from "zod";
-import { attachRequestId, authorizeTenant, requireCallerAuth, resolveCallerTenantId } from "./core/auth.js";
+import { attachRequestId, authorizeTenant, requireAdminAccess, requireCallerAuth, resolveCallerTenantId } from "./core/auth.js";
 import { runArtifactRetentionSweep } from "./core/artifactRetention.js";
 import { createJob, findByIdempotencyKey, findByJobId, getJobByArtifactId, type JobRecord } from "./core/jobStore.js";
 import type { PullScheduleReportInput, PullScheduleReportOutput } from "./types/jobs.js";
@@ -125,6 +125,36 @@ function toPublicSuccessResult(result: PullScheduleReportOutput): Record<string,
   };
 }
 
+function buildJobDiagnostics(record: JobRecord): Record<string, unknown> {
+  const result = record.result;
+  const selectorProfileId =
+    result && !("error_category" in result)
+      ? result.evidence_bundle.selector_profile_id
+      : result && "evidence_bundle" in result
+        ? result.evidence_bundle.selector_profile_id
+        : record.payload.selector_profile_id || "default";
+
+  const selectorVersion =
+    result && !("error_category" in result)
+      ? result.evidence_bundle.selector_version
+      : result && "evidence_bundle" in result
+        ? result.evidence_bundle.selector_version
+        : "unknown";
+
+  return {
+    selector_profile_id: selectorProfileId,
+    selector_version: selectorVersion,
+    attempt_count: record.attempt_count,
+    failure_category: result && "error_category" in result ? result.error_category : undefined,
+    last_step:
+      result && !("error_category" in result)
+        ? result.evidence_bundle.last_step
+        : result && "error_category" in result
+          ? result.last_step
+          : undefined
+  };
+}
+
 const pullScheduleReportSchema = z.object({
   job_id: z.string().min(8).max(128).optional(),
   idempotency_key: z.string().min(8).max(128).optional(),
@@ -176,7 +206,7 @@ app.get("/version", (_req: Request, res: Response) => {
   res.json({ ok: true, service: "therapyhub-emr-gateway", version: APP_VERSION });
 });
 
-app.post("/maintenance/purge_artifacts", requireCallerAuth, async (_req: Request, res: Response) => {
+app.post("/maintenance/purge_artifacts", requireAdminAccess, async (_req: Request, res: Response) => {
   const summary = await runArtifactRetentionSweep();
   return res.json({
     ok: true,
@@ -230,7 +260,15 @@ app.get("/jobs/:jobId", requireCallerAuth, async (req: Request, res: Response) =
       attempt_count: record.attempt_count,
       max_attempts: record.max_attempts,
       created_at: record.created_at,
+      queued_at: record.queued_at,
+      started_at: record.started_at,
+      completed_at: record.completed_at,
+      failed_at: record.failed_at,
+      claimed_at: record.claimed_at,
+      heartbeat_at: record.heartbeat_at,
+      lease_expires_at: record.lease_expires_at,
       updated_at: record.updated_at,
+      diagnostics: buildJobDiagnostics(record),
       result:
         record.result && !("error_category" in record.result)
           ? toPublicSuccessResult(record.result)
@@ -447,6 +485,7 @@ app.post("/jobs/pull_schedule_report", requireCallerAuth, async (req: Request, r
     job_name: "pull_schedule_report",
     status: "queued",
     created_at: nowIso(),
+    queued_at: nowIso(),
     updated_at: nowIso(),
     request_id: requestId,
     attempt_count: 0,
@@ -503,7 +542,15 @@ const workerPollIntervalMsRaw = Number(process.env.WORKER_POLL_INTERVAL_MS || 3_
 const workerPollIntervalMs = Number.isFinite(workerPollIntervalMsRaw) && workerPollIntervalMsRaw > 0
   ? Math.floor(workerPollIntervalMsRaw)
   : 3_000;
-const worker = new PullScheduleReportWorker({ pollIntervalMs: workerPollIntervalMs });
+const workerHeartbeatIntervalMsRaw = Number(process.env.JOB_HEARTBEAT_INTERVAL_MS || 20_000);
+const workerHeartbeatIntervalMs = Number.isFinite(workerHeartbeatIntervalMsRaw) && workerHeartbeatIntervalMsRaw > 0
+  ? Math.floor(workerHeartbeatIntervalMsRaw)
+  : 20_000;
+
+const worker = new PullScheduleReportWorker({
+  pollIntervalMs: workerPollIntervalMs,
+  leaseHeartbeatIntervalMs: workerHeartbeatIntervalMs
+});
 worker.start();
 
 const cleanupIntervalMsRaw = Number(process.env.ARTIFACT_CLEANUP_INTERVAL_MS || 3_600_000);

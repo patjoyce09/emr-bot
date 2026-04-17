@@ -8,7 +8,14 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:path-sanitization": "tsx scripts/tests/path-sanitization.test.ts",
+    "test:stale-recovery": "tsx scripts/tests/stale-running-recovery.test.ts",
+    "test:replay-protection": "tsx scripts/tests/replay-protection.test.ts",
+    "test:admin-auth": "tsx scripts/tests/admin-endpoint-auth.test.ts",
+    "test:single-job-lifecycle": "tsx scripts/tests/single-job-success-lifecycle.test.ts",
+    "test:failed-retry-lifecycle": "tsx scripts/tests/failed-retry-lifecycle.test.ts",
+    "test:hardening": "npm run test:path-sanitization && npm run test:stale-recovery && npm run test:replay-protection && npm run test:admin-auth && npm run test:single-job-lifecycle && npm run test:failed-retry-lifecycle"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

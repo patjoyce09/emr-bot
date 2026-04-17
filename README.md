@@ -98,6 +98,11 @@ Responses:
 
 Runs retention cleanup immediately (also runs on schedule).
 
+This endpoint is admin-only and disabled by default. It requires:
+
+- `ENABLE_ADMIN_ENDPOINTS=true`
+- `Authorization: Bearer <EMR_GATEWAY_ADMIN_TOKEN>`
+
 ### `POST /jobs/pull_schedule_report`
 
 Body:
@@ -161,7 +166,14 @@ Configure at least one:
    - Tenant is inferred from token claim mapping.
 - HMAC headers:
    - `x-emr-timestamp` (epoch seconds)
-   - `x-emr-signature` where signature = `hex(hmac_sha256(secret, timestamp + "." + rawBody))`
+   - optional `x-emr-nonce` (recommended)
+   - `x-emr-signature` where signature base string is:
+     - `METHOD + "\\n" + PATH + "\\n" + TIMESTAMP + "\\n" + NONCE + "\\n" + RAW_BODY`
+     - signature = `hex(hmac_sha256(secret, base_string))`
+
+Replay protection:
+
+- If `x-emr-nonce` is sent, reused nonces are rejected within `EMR_GATEWAY_NONCE_TTL_SEC`.
 
 ### Tenant-auth pattern
 
@@ -179,6 +191,19 @@ Configure at least one:
 - Store location configurable via `JOB_STORE_PATH`.
 - Duplicate keys dedupe active/completed jobs and return existing job identity/state.
 
+Durable worker lifecycle timestamps in job records:
+
+- `queued_at`
+- `started_at`
+- `completed_at`
+- `failed_at`
+- lease fields: `claimed_at`, `heartbeat_at`, `lease_expires_at`
+
+Stale-running recovery:
+
+- Worker re-queues jobs stuck in `running` beyond lease timeout.
+- Recovery never changes already-succeeded jobs.
+
 ### Artifact retention
 
 - Artifacts stay on local disk under `ARTIFACTS_ROOT`.
@@ -192,6 +217,21 @@ Security note:
 - Exported downloads and screenshots may contain PHI.
 - Store artifacts only in secure encrypted storage with strict access controls.
 - Retention settings should be aligned to your HIPAA and operational policies.
+
+### On-disk path safety
+
+- Artifact filesystem path segments are normalized before use.
+- Raw tenant/job/run identifiers are preserved in metadata only, not used directly as unsafe disk path segments.
+
+### Operator diagnostics
+
+`GET /jobs/:jobId` includes safe diagnostics for operations:
+
+- `selector_profile_id`
+- `selector_version`
+- `attempt_count`
+- `failure_category`
+- `last_step`
 
 ### Worker configuration
 

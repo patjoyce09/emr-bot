@@ -4,6 +4,7 @@ import { categorizeError } from "../../core/errors.js";
 import type { StructuredStepLogger } from "../../core/logger.js";
 import type { ArtifactPaths } from "../../core/artifacts.js";
 import { getFileMetadata, writeJson } from "../../core/artifacts.js";
+import { sanitizeFilename } from "../../core/pathSafety.js";
 import type {
   PullScheduleReportFailure,
   PullScheduleReportInput,
@@ -139,7 +140,7 @@ export async function runPullScheduleReport(
       ctx.page.locator(ctx.selectors.exportButton).first().click()
     ]);
 
-    exportFilename = download.suggestedFilename();
+    exportFilename = sanitizeFilename(download.suggestedFilename());
     if (!exportFilename) {
       throw new Error("Download did not provide a filename.");
     }
